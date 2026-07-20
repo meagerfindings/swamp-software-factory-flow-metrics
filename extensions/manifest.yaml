@@ -1,0 +1,33 @@
+manifestVersion: 1
+name: "@mgreten/software-factory-flow-metrics"
+version: "2026.07.20.1"
+description: >
+  Deterministic quality, reliability, and flow metrics for a @swamp/software-factory
+  work item — time-to-terminal, per-stage durations and entry counts, dispatch
+  attempts, failed/parked stage, human touches, patch cycles, and terminal outcome —
+  with a cross-run aggregate, every number traceable to the journal or artifact record
+  it came from, rendered statically from recorded run data with no LLM involved.
+
+repository: https://github.com/meagerfindings/swamp-software-factory-flow-metrics
+
+models: []
+workflows: []
+vaults: []
+drivers: []
+datastores: []
+reports:
+  - flow_metrics_report.ts
+
+additionalFiles:
+  - README.md
+  - LICENSE.txt
+
+labels:
+  - software-factory
+  - report
+  - metrics
+  - observability
+  - flow
+
+platforms: []
+dependencies: []
