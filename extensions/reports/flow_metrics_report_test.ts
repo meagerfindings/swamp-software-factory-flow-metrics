@@ -67,6 +67,22 @@ function journal(
   }));
 }
 
+/**
+ * One approval record as the factory writes it (models/_lib/run_data.ts).
+ * `version` models the versioned `approval-<slug>-<gateId>` instance: the same
+ * gate re-decided writes a new version of the same instance.
+ */
+interface ApprovalSpec {
+  gateId: string;
+  version: number;
+  decision: "approved" | "rejected";
+  stageId: string;
+  cycle: number;
+  decidedAt: string;
+  actor?: string;
+  note?: string;
+}
+
 function metricsData(opts: {
   workItem?: string;
   slug?: string;
@@ -75,6 +91,9 @@ function metricsData(opts: {
   journal: MetricsData["journal"];
   artifacts?: ArtifactSpec[];
   journalTruncated?: boolean;
+  approvals?: ApprovalSpec[];
+  approvalsTruncated?: boolean;
+  cycles?: Record<string, number>;
 }): MetricsData {
   const workItem = opts.workItem ?? "WI-700";
   const slug = opts.slug ?? workItem;
@@ -87,12 +106,27 @@ function metricsData(opts: {
     perVersion.set(spec.version, artifactEnvelope(spec, workItem));
     artifactVersions.set(spec.name, perVersion);
   }
+  const approvalVersions = new Map<string, Map<number, unknown>>();
+  for (const spec of opts.approvals ?? []) {
+    const perVersion = approvalVersions.get(spec.gateId) ?? new Map();
+    perVersion.set(spec.version, {
+      gateId: spec.gateId,
+      workItem,
+      decision: spec.decision,
+      actor: spec.actor ?? "human@example.com",
+      note: spec.note,
+      stageId: spec.stageId,
+      cycle: spec.cycle,
+      decidedAt: spec.decidedAt,
+    });
+    approvalVersions.set(spec.gateId, perVersion);
+  }
   return {
     slug,
     state: {
       workItem,
       stageId: opts.stageId ?? "implementation",
-      cycles: {},
+      cycles: opts.cycles ?? {},
       enteredAt: "2026-07-18T00:00:00.000Z",
       status: opts.status ?? "active",
       definitionVersion: 1,
@@ -103,6 +137,9 @@ function metricsData(opts: {
     // deno-lint-ignore no-explicit-any
     artifactVersions: artifactVersions as any,
     evidenceVersions: new Map(),
+    // deno-lint-ignore no-explicit-any
+    approvalVersions: approvalVersions as any,
+    approvalsTruncated: opts.approvalsTruncated ?? false,
   };
 }
 
@@ -690,4 +727,939 @@ Deno.test("loadMetricsData reads only state/journal/artifact records addressed b
     ),
   );
   assert(!reads.some((r) => r.includes("transcript") || r.includes("chat")));
+});
+
+// ---------------------------------------------------------------------------
+// Ceremony & approval-friction baseline (FRK-METRICS-002).
+//
+// Every case below is built from records the canonical @swamp/software-factory
+// actually writes: journal entries with their real payload fields, and
+// versioned `approval-<slug>-<gateId>` records carrying decision/stageId/
+// cycle/decidedAt. Nothing here invents a timestamp or an identity.
+// ---------------------------------------------------------------------------
+
+/** A journal spine: started → review → done, with realistic timestamps. */
+function reviewRunJournal(workItem: string) {
+  return journal([
+    {
+      event: "started",
+      payload: { workItem, stage: "implementation" },
+      at: "2026-07-18T00:00:00.000Z",
+      stageId: "implementation",
+    },
+    {
+      event: "advanced",
+      payload: {
+        transition: "to-review",
+        from: "implementation",
+        to: "review",
+        cycle: 1,
+      },
+      at: "2026-07-18T01:00:00.000Z",
+      stageId: "review",
+    },
+    {
+      event: "approved",
+      payload: { gateId: "ship-it", actor: "human@example.com" },
+      at: "2026-07-18T01:30:00.000Z",
+      stageId: "review",
+    },
+    {
+      event: "run_terminal",
+      payload: { transition: "finish", from: "review", to: "done", cycle: 1 },
+      at: "2026-07-18T02:00:00.000Z",
+      stageId: "done",
+    },
+  ], workItem);
+}
+
+Deno.test("duplicate approval records for one decision count once as distinct, and the retry delta is preserved", () => {
+  // The same gate re-recorded twice at the same stage+cycle+decision: one
+  // logical decision, two raw records (a retry / replay).
+  const data = metricsData({
+    status: "terminal",
+    stageId: "done",
+    journal: reviewRunJournal("WI-700"),
+    approvals: [
+      {
+        gateId: "ship-it",
+        version: 1,
+        decision: "approved",
+        stageId: "review",
+        cycle: 1,
+        decidedAt: "2026-07-18T01:30:00.000Z",
+      },
+      {
+        gateId: "ship-it",
+        version: 2,
+        decision: "approved",
+        stageId: "review",
+        cycle: 1,
+        decidedAt: "2026-07-18T01:31:00.000Z",
+      },
+    ],
+  });
+  const c = buildFlowMetrics(data, "WI-700").ceremony;
+
+  assertEquals(c.rawDecisionRecordCount, 2);
+  assertEquals(c.humanTouches.value, 2);
+  // Deduplicated by gateId+stageId+cycle+decision.
+  assertEquals(c.distinctDecisionCount.value, 1);
+  assertEquals(c.distinctDecisions.length, 1);
+  assertEquals(c.distinctDecisions[0].recordCount, 2);
+  // The EARLIEST decidedAt is kept as the moment the human decided.
+  assertEquals(
+    c.distinctDecisions[0].firstDecidedAt,
+    "2026-07-18T01:30:00.000Z",
+  );
+  assertEquals(c.approvals.value, 1);
+  assertEquals(c.rejections.value, 0);
+});
+
+Deno.test("the same gate decided on different cycles is two distinct decisions, not a duplicate", () => {
+  // Rejected on cycle 1, approved on cycle 2 — two real decisions. Collapsing
+  // them would erase the rejection entirely.
+  const data = metricsData({
+    status: "terminal",
+    stageId: "done",
+    journal: reviewRunJournal("WI-701"),
+    approvals: [
+      {
+        gateId: "ship-it",
+        version: 1,
+        decision: "rejected",
+        stageId: "review",
+        cycle: 1,
+        decidedAt: "2026-07-18T01:30:00.000Z",
+      },
+      {
+        gateId: "ship-it",
+        version: 2,
+        decision: "approved",
+        stageId: "review",
+        cycle: 2,
+        decidedAt: "2026-07-18T01:45:00.000Z",
+      },
+    ],
+  });
+  const c = buildFlowMetrics(data, "WI-701").ceremony;
+
+  assertEquals(c.distinctDecisionCount.value, 2);
+  // Approvals and rejections are tracked separately, per gate and in total.
+  assertEquals(c.approvals.value, 1);
+  assertEquals(c.rejections.value, 1);
+  assertEquals(c.approvalsByGate["ship-it"], 1);
+  assertEquals(c.rejectionsByGate["ship-it"], 1);
+});
+
+Deno.test("approvals and rejections separate per gate across multiple gates", () => {
+  const data = metricsData({
+    status: "terminal",
+    stageId: "done",
+    journal: reviewRunJournal("WI-702"),
+    approvals: [
+      {
+        gateId: "ship-it",
+        version: 1,
+        decision: "approved",
+        stageId: "review",
+        cycle: 1,
+        decidedAt: "2026-07-18T01:30:00.000Z",
+      },
+      {
+        gateId: "security-sign-off",
+        version: 1,
+        decision: "rejected",
+        stageId: "review",
+        cycle: 1,
+        decidedAt: "2026-07-18T01:20:00.000Z",
+      },
+      {
+        gateId: "security-sign-off",
+        version: 2,
+        decision: "approved",
+        stageId: "review",
+        cycle: 1,
+        decidedAt: "2026-07-18T01:40:00.000Z",
+      },
+    ],
+  });
+  const c = buildFlowMetrics(data, "WI-702").ceremony;
+
+  assertEquals(c.approvals.value, 2);
+  assertEquals(c.rejections.value, 1);
+  assertEquals(c.approvalsByGate["ship-it"], 1);
+  assertEquals(c.approvalsByGate["security-sign-off"], 1);
+  assertEquals(c.rejectionsByGate["security-sign-off"], 1);
+  // A gate never rejected does not appear as a zero entry.
+  assertEquals(c.rejectionsByGate["ship-it"], undefined);
+});
+
+Deno.test("approval wait is unavailable when only stage entry and decision timestamps exist", () => {
+  const data = metricsData({
+    status: "terminal",
+    stageId: "done",
+    journal: reviewRunJournal("WI-703"),
+    approvals: [
+      {
+        gateId: "ship-it",
+        version: 1,
+        decision: "approved",
+        stageId: "review",
+        cycle: 1,
+        // Entered review at 01:00 and decided at 01:30, but stage entry does
+        // not prove when this specific gate became pending.
+        decidedAt: "2026-07-18T01:30:00.000Z",
+      },
+    ],
+  });
+  const c = buildFlowMetrics(data, "WI-703").ceremony;
+
+  assertEquals(c.approvalWaits.length, 1);
+  assertEquals(c.approvalWaits[0].waitMs, null);
+  assertEquals(c.approvalWaits[0].availability, "unavailable");
+  assertStringIncludes(c.approvalWaits[0].reason ?? "", "pendingSince");
+  assertEquals(c.meanApprovalWaitMs.value, null);
+  assertEquals(c.meanApprovalWaitMs.availability, "unavailable");
+});
+
+Deno.test("a decision with no surviving stage-cycle entry is unavailable, NOT a zero wait", () => {
+  // The decision was recorded against review cycle 3, but the journal shows
+  // no entry into review cycle 3 — the pending moment is unknowable.
+  const data = metricsData({
+    status: "terminal",
+    stageId: "done",
+    journal: reviewRunJournal("WI-704"),
+    approvals: [
+      {
+        gateId: "ship-it",
+        version: 1,
+        decision: "approved",
+        stageId: "review",
+        cycle: 3,
+        decidedAt: "2026-07-18T01:30:00.000Z",
+      },
+    ],
+  });
+  const c = buildFlowMetrics(data, "WI-704").ceremony;
+
+  assertEquals(c.approvalWaits[0].waitMs, null);
+  assertEquals(c.approvalWaits[0].availability, "unavailable");
+  assert(c.approvalWaits[0].reason !== undefined);
+  // The critical assertion: an unmeasurable wait must never surface as 0.
+  assertEquals(c.meanApprovalWaitMs.value, null);
+  assertEquals(c.meanApprovalWaitMs.availability, "unavailable");
+  assertEquals(c.meanApprovalWaitMs.covered, 0);
+  assertEquals(c.meanApprovalWaitMs.total, 1);
+  // And it renders as "unavailable", not as "0s".
+  const md = renderFlowMetricsMarkdown({
+    workItem: "WI-704",
+    metrics: buildFlowMetrics(data, "WI-704"),
+  });
+  assertStringIncludes(md, "unavailable");
+});
+
+Deno.test("multiple decisions remain unavailable without canonical pending timestamps", () => {
+  const data = metricsData({
+    status: "terminal",
+    stageId: "done",
+    journal: reviewRunJournal("WI-705"),
+    approvals: [
+      {
+        gateId: "ship-it",
+        version: 1,
+        decision: "approved",
+        stageId: "review",
+        cycle: 1,
+        decidedAt: "2026-07-18T01:30:00.000Z", // 30m wait
+      },
+      {
+        gateId: "security-sign-off",
+        version: 1,
+        decision: "approved",
+        stageId: "review",
+        cycle: 9, // no journal entry into review cycle 9
+        decidedAt: "2026-07-18T01:50:00.000Z",
+      },
+    ],
+  });
+  const c = buildFlowMetrics(data, "WI-705").ceremony;
+
+  assertEquals(c.meanApprovalWaitMs.availability, "unavailable");
+  assertEquals(c.meanApprovalWaitMs.value, null);
+  assertEquals(c.meanApprovalWaitMs.covered, 0);
+  assertEquals(c.meanApprovalWaitMs.total, 2);
+  assert(c.meanApprovalWaitMs.reason !== undefined);
+});
+
+Deno.test("repeated stage visits and cycles are counted from journal and state facts", () => {
+  const workItem = "WI-706";
+  const data = metricsData({
+    status: "terminal",
+    stageId: "done",
+    // implementation → review → implementation (rework) → review → done
+    journal: journal([
+      {
+        event: "started",
+        payload: { workItem, stage: "implementation" },
+        at: "2026-07-18T00:00:00.000Z",
+        stageId: "implementation",
+      },
+      {
+        event: "advanced",
+        payload: {
+          transition: "to-review",
+          from: "implementation",
+          to: "review",
+          cycle: 1,
+        },
+        at: "2026-07-18T01:00:00.000Z",
+        stageId: "review",
+      },
+      {
+        event: "advanced",
+        payload: {
+          transition: "rework",
+          from: "review",
+          to: "implementation",
+          cycle: 2,
+        },
+        at: "2026-07-18T02:00:00.000Z",
+        stageId: "implementation",
+      },
+      {
+        event: "advanced",
+        payload: {
+          transition: "to-review",
+          from: "implementation",
+          to: "review",
+          cycle: 2,
+        },
+        at: "2026-07-18T03:00:00.000Z",
+        stageId: "review",
+      },
+      {
+        event: "run_terminal",
+        payload: { transition: "finish", from: "review", to: "done", cycle: 1 },
+        at: "2026-07-18T04:00:00.000Z",
+        stageId: "done",
+      },
+    ], workItem),
+    // The factory's own cycle counter is authoritative when present.
+    cycles: { implementation: 2, review: 2, done: 1 },
+  });
+  const c = buildFlowMetrics(data, workItem).ceremony;
+
+  // 5 visits: implementation x2, review x2, done x1.
+  assertEquals(c.stageVisitCount.value, 5);
+  assertEquals(c.uniqueStageCount.value, 3);
+  assertEquals(c.cycleCount.value, 5);
+  assertEquals(c.cycleCount.availability, "available");
+  // Review frequency = 2 review visits / 5 total visits.
+  assertEquals(c.reviewFrequency.value, 2 / 5);
+  assertEquals(c.reviewFrequency.covered, 2);
+  assertEquals(c.reviewFrequency.total, 5);
+  assertEquals(c.patchFrequency.value, 0);
+});
+
+Deno.test("cycleCount falls back to journal reconstruction and is labelled partial", () => {
+  const data = metricsData({
+    status: "terminal",
+    stageId: "done",
+    journal: reviewRunJournal("WI-707"),
+    cycles: {}, // no state cycles map
+  });
+  const c = buildFlowMetrics(data, "WI-707").ceremony;
+  assertEquals(c.cycleCount.availability, "partial");
+  assert(c.cycleCount.reason !== undefined);
+});
+
+Deno.test("stage yield and park derive from explicit transition facts", () => {
+  const workItem = "WI-708";
+  const data = metricsData({
+    status: "terminal",
+    stageId: "review-blocked",
+    journal: journal([
+      {
+        event: "started",
+        payload: { workItem, stage: "implementation" },
+        at: "2026-07-18T00:00:00.000Z",
+        stageId: "implementation",
+      },
+      {
+        event: "advanced",
+        payload: {
+          transition: "to-review",
+          from: "implementation",
+          to: "review",
+          cycle: 1,
+        },
+        at: "2026-07-18T01:00:00.000Z",
+        stageId: "review",
+      },
+      {
+        event: "run_terminal",
+        payload: {
+          transition: "park",
+          from: "review",
+          to: "review-blocked",
+          cycle: 1,
+        },
+        at: "2026-07-18T02:00:00.000Z",
+        stageId: "review-blocked",
+      },
+    ], workItem),
+  });
+  const c = buildFlowMetrics(data, workItem).ceremony;
+
+  const impl = c.stageFlow.find((s) => s.stageId === "implementation");
+  assert(impl !== undefined);
+  // implementation handed work onward once, never parked → 100% yield.
+  assertEquals(impl.advancedOut, 1);
+  assertEquals(impl.parkedAt, 0);
+  assertEquals(impl.yieldRate, 1);
+  assertEquals(impl.parkRate, 0);
+
+  // review-blocked is a terminal, non-done landing → parked.
+  const blocked = c.stageFlow.find((s) => s.stageId === "review-blocked");
+  assert(blocked !== undefined);
+  assertEquals(blocked.parkedAt, 1);
+  assertEquals(blocked.parkRate, 1);
+  assertEquals(blocked.yieldRate, 0);
+  // Every stage-flow row carries its source pointers.
+  assert(blocked.sources.length > 0);
+});
+
+Deno.test("a stage entered but never resolved has null yield/park, not zero", () => {
+  const workItem = "WI-709";
+  const data = metricsData({
+    status: "active",
+    stageId: "review",
+    journal: journal([
+      {
+        event: "started",
+        payload: { workItem, stage: "implementation" },
+        at: "2026-07-18T00:00:00.000Z",
+        stageId: "implementation",
+      },
+      {
+        event: "advanced",
+        payload: {
+          transition: "to-review",
+          from: "implementation",
+          to: "review",
+          cycle: 1,
+        },
+        at: "2026-07-18T01:00:00.000Z",
+        stageId: "review",
+      },
+    ], workItem),
+  });
+  const c = buildFlowMetrics(data, workItem, {
+    now: "2026-07-18T02:00:00.000Z",
+  }).ceremony;
+  // `review` never advanced out and never parked — it has no yield rate at
+  // all, which must not be reported as a 0% yield.
+  assertEquals(c.stageFlow.find((s) => s.stageId === "review"), undefined);
+});
+
+Deno.test("cycle override and bounded-loop exhaustion surface the stages actually unblocked", () => {
+  const workItem = "WI-710";
+  const data = metricsData({
+    status: "terminal",
+    stageId: "done",
+    journal: journal([
+      {
+        event: "started",
+        payload: { workItem, stage: "implementation" },
+        at: "2026-07-18T00:00:00.000Z",
+        stageId: "implementation",
+      },
+      // A human buys review one more entry past its maxCycles.
+      {
+        event: "approved",
+        payload: {
+          gateId: "cycle-override:review",
+          actor: "human@example.com",
+        },
+        at: "2026-07-18T01:00:00.000Z",
+        stageId: "implementation",
+      },
+      // The journal then shows review actually being entered afterwards.
+      {
+        event: "advanced",
+        payload: {
+          transition: "to-review",
+          from: "implementation",
+          to: "review",
+          cycle: 3,
+        },
+        at: "2026-07-18T01:30:00.000Z",
+        stageId: "review",
+      },
+      {
+        event: "run_terminal",
+        payload: { transition: "finish", from: "review", to: "done", cycle: 1 },
+        at: "2026-07-18T02:00:00.000Z",
+        stageId: "done",
+      },
+    ], workItem),
+    approvals: [
+      {
+        gateId: "cycle-override:review",
+        version: 1,
+        decision: "approved",
+        stageId: "implementation",
+        cycle: 1,
+        decidedAt: "2026-07-18T01:00:00.000Z",
+      },
+    ],
+  });
+  const c = buildFlowMetrics(data, workItem).ceremony;
+
+  assertEquals(c.cycleOverrideCount.value, 1);
+  // Keyed by the OVERRIDDEN stage (the gate id's suffix), not the stage the
+  // grant was recorded in.
+  assertEquals(c.boundedLoopExhaustions, [{ stage: "review", overrides: 1 }]);
+  // The journal shows a later entry into review, so the override is recorded
+  // as having actually unblocked it.
+  assertEquals(c.stagesUnblocked, ["review"]);
+  assertEquals(c.distinctDecisions[0].isCycleOverride, true);
+});
+
+Deno.test("an override with no subsequent stage entry is counted but not claimed to have unblocked", () => {
+  const workItem = "WI-711";
+  const data = metricsData({
+    status: "active",
+    stageId: "implementation",
+    journal: journal([
+      {
+        event: "started",
+        payload: { workItem, stage: "implementation" },
+        at: "2026-07-18T00:00:00.000Z",
+        stageId: "implementation",
+      },
+      {
+        event: "approved",
+        payload: {
+          gateId: "cycle-override:review",
+          actor: "human@example.com",
+        },
+        at: "2026-07-18T01:00:00.000Z",
+        stageId: "implementation",
+      },
+    ], workItem),
+    approvals: [
+      {
+        gateId: "cycle-override:review",
+        version: 1,
+        decision: "approved",
+        stageId: "implementation",
+        cycle: 1,
+        decidedAt: "2026-07-18T01:00:00.000Z",
+      },
+    ],
+  });
+  const c = buildFlowMetrics(data, workItem, {
+    now: "2026-07-18T02:00:00.000Z",
+  }).ceremony;
+
+  assertEquals(c.cycleOverrideCount.value, 1);
+  assertEquals(c.boundedLoopExhaustions, [{ stage: "review", overrides: 1 }]);
+  // No later entry into review → the records do not show it took effect.
+  assertEquals(c.stagesUnblocked, []);
+});
+
+Deno.test("an absent risk profile stays unknown and is never inferred from names", () => {
+  // The work item ref and stage ids both scream "security hotfix", and the
+  // work order records a delivery mode but no risk/authority/work class.
+  const workItem = "SEC-CRITICAL-hotfix-911";
+  const data = metricsData({
+    workItem,
+    slug: workItem,
+    status: "terminal",
+    stageId: "done",
+    journal: journal([
+      {
+        event: "started",
+        payload: { workItem, stage: "hotfix" },
+        at: "2026-07-18T00:00:00.000Z",
+        stageId: "hotfix",
+      },
+      {
+        event: "run_terminal",
+        payload: { transition: "finish", from: "hotfix", to: "done", cycle: 1 },
+        at: "2026-07-18T01:00:00.000Z",
+        stageId: "done",
+      },
+    ], workItem),
+    artifacts: [{
+      name: "approved-work-order",
+      version: 1,
+      payload: { deliveryMode: "express" },
+    }],
+  });
+  const c = buildFlowMetrics(data, workItem).ceremony;
+
+  assertEquals(c.dimensions.riskProfile, null);
+  assertEquals(c.dimensions.authorityProfile, null);
+  assertEquals(c.dimensions.workClass, null);
+  assertEquals(c.dimensions.factory, null);
+});
+
+Deno.test("recorded dimensions are read verbatim from the intake work order", () => {
+  const workItem = "WI-712";
+  const data = metricsData({
+    workItem,
+    slug: workItem,
+    status: "terminal",
+    stageId: "done",
+    journal: reviewRunJournal(workItem),
+    artifacts: [{
+      name: "approved-work-order",
+      version: 1,
+      payload: {
+        deliveryMode: "standard",
+        workClass: "feature",
+        riskProfile: "high",
+        authorityProfile: "dual-control",
+      },
+    }],
+  });
+  const c = buildFlowMetrics(data, workItem, {
+    factoryName: "my-factory",
+  }).ceremony;
+
+  assertEquals(c.dimensions.workClass, "feature");
+  assertEquals(c.dimensions.riskProfile, "high");
+  assertEquals(c.dimensions.authorityProfile, "dual-control");
+  assertEquals(c.dimensions.factory, "my-factory");
+  // Dimensions read off a record carry that record as their source.
+  assert(c.dimensions.sources.length > 0);
+  assertEquals(c.dimensions.sources[0].kind, "artifact");
+});
+
+Deno.test("generic evidence does not fabricate time to verified draft", () => {
+  const workItem = "WI-713";
+  const withEvidence = metricsData({
+    workItem,
+    slug: workItem,
+    status: "terminal",
+    stageId: "done",
+    journal: journal([
+      {
+        event: "started",
+        payload: { workItem, stage: "implementation" },
+        at: "2026-07-18T00:00:00.000Z",
+        stageId: "implementation",
+      },
+      {
+        event: "evidence_recorded",
+        payload: { name: "test-run" },
+        at: "2026-07-18T00:45:00.000Z",
+        stageId: "implementation",
+      },
+      {
+        event: "run_terminal",
+        payload: {
+          transition: "finish",
+          from: "implementation",
+          to: "done",
+          cycle: 1,
+        },
+        at: "2026-07-18T01:00:00.000Z",
+        stageId: "done",
+      },
+    ], workItem),
+  });
+  const withEvidenceCeremony = buildFlowMetrics(withEvidence, workItem)
+    .ceremony;
+  assertEquals(withEvidenceCeremony.timeToVerifiedDraftMs.value, null);
+  assertEquals(
+    withEvidenceCeremony.timeToVerifiedDraftMs.availability,
+    "unavailable",
+  );
+  assertStringIncludes(
+    withEvidenceCeremony.timeToVerifiedDraftMs.reason ?? "",
+    "explicit verified-draft",
+  );
+
+  // Without any verification lifecycle record, it is unavailable — not 0 and
+  // not estimated from stage ordering.
+  const withoutEvidence = metricsData({
+    status: "terminal",
+    stageId: "done",
+    journal: reviewRunJournal("WI-714"),
+  });
+  const c = buildFlowMetrics(withoutEvidence, "WI-714").ceremony;
+  assertEquals(c.timeToVerifiedDraftMs.value, null);
+  assertEquals(c.timeToVerifiedDraftMs.availability, "unavailable");
+  assert(c.timeToVerifiedDraftMs.reason !== undefined);
+});
+
+Deno.test("a run with no approval records reports decisions unavailable, not zero", () => {
+  const data = metricsData({
+    status: "terminal",
+    stageId: "done",
+    journal: reviewRunJournal("WI-715"),
+    // The journal shows an `approved` event, but the approval record itself
+    // was garbage-collected.
+  });
+  const c = buildFlowMetrics(data, "WI-715").ceremony;
+
+  assertEquals(c.humanTouches.value, null);
+  assertEquals(c.humanTouches.availability, "unavailable");
+  assertEquals(c.distinctDecisionCount.value, null);
+  assertEquals(c.approvals.value, null);
+  assertEquals(c.rejections.value, null);
+  assert(c.humanTouches.reason !== undefined);
+});
+
+Deno.test("truncated approval history is labelled partial as a lower bound", () => {
+  const data = metricsData({
+    status: "terminal",
+    stageId: "done",
+    journal: reviewRunJournal("WI-716"),
+    approvals: [
+      {
+        gateId: "ship-it",
+        version: 4,
+        decision: "approved",
+        stageId: "review",
+        cycle: 1,
+        decidedAt: "2026-07-18T01:30:00.000Z",
+      },
+    ],
+    approvalsTruncated: true,
+  });
+  const c = buildFlowMetrics(data, "WI-716").ceremony;
+  assertEquals(c.distinctDecisionCount.availability, "partial");
+  assertEquals(c.approvalsTruncated, true);
+  assert(c.distinctDecisionCount.reason !== undefined);
+});
+
+Deno.test("cross-run aggregation never averages unavailable durations into zero", () => {
+  // Run A: a measurable 30-minute approval wait and a verified draft.
+  const runA = buildFlowMetrics(
+    metricsData({
+      workItem: "WI-A",
+      slug: "WI-A",
+      status: "terminal",
+      stageId: "done",
+      journal: journal([
+        {
+          event: "started",
+          payload: { workItem: "WI-A", stage: "implementation" },
+          at: "2026-07-18T00:00:00.000Z",
+          stageId: "implementation",
+        },
+        {
+          event: "evidence_recorded",
+          payload: { name: "test-run" },
+          at: "2026-07-18T00:30:00.000Z",
+          stageId: "implementation",
+        },
+        {
+          event: "advanced",
+          payload: {
+            transition: "to-review",
+            from: "implementation",
+            to: "review",
+            cycle: 1,
+          },
+          at: "2026-07-18T01:00:00.000Z",
+          stageId: "review",
+        },
+        {
+          event: "run_terminal",
+          payload: {
+            transition: "finish",
+            from: "review",
+            to: "done",
+            cycle: 1,
+          },
+          at: "2026-07-18T02:00:00.000Z",
+          stageId: "done",
+        },
+      ], "WI-A"),
+      approvals: [{
+        gateId: "ship-it",
+        version: 1,
+        decision: "approved",
+        stageId: "review",
+        cycle: 1,
+        decidedAt: "2026-07-18T01:30:00.000Z",
+      }],
+    }),
+    "WI-A",
+  );
+
+  // Run B: a decision whose pending moment is unknowable, and no verified
+  // draft at all.
+  const runB = buildFlowMetrics(
+    metricsData({
+      workItem: "WI-B",
+      slug: "WI-B",
+      status: "terminal",
+      stageId: "done",
+      journal: reviewRunJournal("WI-B"),
+      approvals: [{
+        gateId: "ship-it",
+        version: 1,
+        decision: "approved",
+        stageId: "review",
+        cycle: 7, // no journal entry into review cycle 7
+        decidedAt: "2026-07-18T01:30:00.000Z",
+      }],
+    }),
+    "WI-B",
+  );
+
+  const agg = aggregateFlowMetrics([runA, runB]).ceremony;
+
+  // Neither stage entry nor generic evidence supplies either canonical
+  // endpoint, and the aggregate never turns either missing duration into 0.
+  assertEquals(agg.meanApprovalWaitMs.value, null);
+  assertEquals(agg.meanApprovalWaitMs.availability, "unavailable");
+  assertEquals(agg.approvalWaitCoverage, { covered: 0, total: 2 });
+
+  assertEquals(agg.meanTimeToVerifiedDraftMs.value, null);
+  assertEquals(agg.meanTimeToVerifiedDraftMs.availability, "unavailable");
+  assertEquals(agg.meanTimeToVerifiedDraftMs.covered, 0);
+  assertEquals(agg.meanTimeToVerifiedDraftMs.total, 2);
+
+  // Counts still fold across both runs.
+  assertEquals(agg.runs, 2);
+  assertEquals(agg.runsWithDecisionRecords, 2);
+  assertEquals(agg.totalApprovals.value, 2);
+  assertEquals(agg.approvalsByGate["ship-it"], 2);
+});
+
+Deno.test("cross-run aggregation reports unavailable when no run had a measurable value", () => {
+  const noRecords = () =>
+    buildFlowMetrics(
+      metricsData({
+        status: "terminal",
+        stageId: "done",
+        journal: reviewRunJournal("WI-C"),
+      }),
+      "WI-C",
+    );
+  const agg = aggregateFlowMetrics([noRecords(), noRecords()]).ceremony;
+
+  assertEquals(agg.totalApprovals.value, null);
+  assertEquals(agg.totalApprovals.availability, "unavailable");
+  assertEquals(agg.runsWithDecisionRecords, 0);
+  assertEquals(agg.meanApprovalWaitMs.value, null);
+  assertEquals(agg.meanApprovalWaitMs.availability, "unavailable");
+  assertEquals(agg.meanTimeToVerifiedDraftMs.value, null);
+});
+
+Deno.test("cross-run dimension buckets keep absent dimensions as unknown", () => {
+  const known = buildFlowMetrics(
+    metricsData({
+      workItem: "WI-D",
+      slug: "WI-D",
+      status: "terminal",
+      stageId: "done",
+      journal: reviewRunJournal("WI-D"),
+      artifacts: [{
+        name: "approved-work-order",
+        version: 1,
+        payload: { riskProfile: "high", workClass: "feature" },
+      }],
+    }),
+    "WI-D",
+  );
+  const unknown = buildFlowMetrics(
+    metricsData({
+      workItem: "WI-E",
+      slug: "WI-E",
+      status: "terminal",
+      stageId: "done",
+      journal: reviewRunJournal("WI-E"),
+    }),
+    "WI-E",
+  );
+  const agg = aggregateFlowMetrics([known, unknown]).ceremony;
+
+  assertEquals(agg.runsByRiskProfile["high"], 1);
+  assertEquals(agg.runsByRiskProfile["unknown"], 1);
+  assertEquals(agg.runsByWorkClass["feature"], 1);
+  assertEquals(agg.runsByWorkClass["unknown"], 1);
+  assertEquals(agg.runsByAuthorityProfile["unknown"], 2);
+});
+
+Deno.test("loadMetricsData reads approval records addressed by gate ids in the journal", async () => {
+  const slug = workItemSlug("WI-F");
+  const reads: string[] = [];
+  const store: Record<string, Record<number, Record<string, unknown>>> = {
+    [`state-${slug}`]: {
+      1: {
+        workItem: "WI-F",
+        stageId: "done",
+        cycles: { review: 1 },
+        enteredAt: "2026-07-18T02:00:00.000Z",
+        status: "terminal",
+        definitionVersion: 1,
+        startedAt: "2026-07-18T00:00:00.000Z",
+      },
+    },
+    [`journal-${slug}`]: {
+      1: {
+        event: "started",
+        workItem: "WI-F",
+        stageId: "review",
+        summary: "started",
+        payload: { workItem: "WI-F", stage: "review" },
+        at: "2026-07-18T00:00:00.000Z",
+      },
+      2: {
+        event: "approved",
+        workItem: "WI-F",
+        stageId: "review",
+        summary: "approved",
+        payload: { gateId: "ship-it", actor: "human@example.com" },
+        at: "2026-07-18T01:00:00.000Z",
+      },
+    },
+    [`approval-${slug}-ship-it`]: {
+      1: {
+        gateId: "ship-it",
+        workItem: "WI-F",
+        decision: "approved",
+        actor: "human@example.com",
+        stageId: "review",
+        cycle: 1,
+        decidedAt: "2026-07-18T01:00:00.000Z",
+      },
+    },
+  };
+  const reader: RunDataReader = {
+    versionsOf: (name) => {
+      reads.push(`versions:${name}`);
+      return Promise.resolve(Object.keys(store[name] ?? {}).map(Number));
+    },
+    read: (name, version) => {
+      reads.push(`read:${name}`);
+      const versions = store[name];
+      if (versions === undefined) return Promise.resolve(null);
+      const v = version ?? Math.max(...Object.keys(versions).map(Number));
+      return Promise.resolve(versions[v] ?? null);
+    },
+  };
+  const data = await loadMetricsData(reader, slug);
+
+  // The journal's decision event named the gate, which addressed the record.
+  assertEquals(data.approvalVersions.get("ship-it")?.size, 1);
+  assert(reads.includes(`read:approval-${slug}-ship-it`));
+
+  const c = buildFlowMetrics(data, "WI-F").ceremony;
+  assertEquals(c.distinctDecisionCount.value, 1);
+  // Entered review at start and decided an hour later, but no canonical
+  // pending timestamp exists, so that interval is not called approval wait.
+  assertEquals(c.approvalWaits[0].waitMs, null);
+  assertEquals(c.approvalWaits[0].availability, "unavailable");
+  // The decision carries an approval-record source pointer.
+  assert(c.humanTouches.sources.some((s) => s.kind === "approval"));
 });

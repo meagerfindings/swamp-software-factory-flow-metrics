@@ -1,12 +1,19 @@
 manifestVersion: 1
 name: "@mgreten/software-factory-flow-metrics"
-version: "2026.07.20.1"
+version: "2026.08.02.1"
 description: >
-  Deterministic quality, reliability, and flow metrics for a @swamp/software-factory
-  work item — time-to-terminal, per-stage durations and entry counts, dispatch
-  attempts, failed/parked stage, human touches, patch cycles, and terminal outcome —
-  with a cross-run aggregate, every number traceable to the journal or artifact record
-  it came from, rendered statically from recorded run data with no LLM involved.
+  Deterministic quality, reliability, flow, and ceremony metrics for a
+  @swamp/software-factory work item — time-to-terminal, per-stage durations, entry
+  counts and time-to-gate, dispatch attempts, failed/parked stage, human touches,
+  deduplicated human decisions keyed by gate+stage+cycle+decision, approvals and
+  rejections per gate, approval wait durations, stage visit/cycle counts,
+  review/patch frequency, stage yield and park rates, time to verified draft,
+  bounded-loop exhaustion, human cycle-limit overrides and the stages they
+  unblocked, delivery mode, and terminal outcome — with a cross-run aggregate,
+  every metric carrying a trust/availability label and a source pointer back to the
+  journal, approval, or artifact record it came from, so unmeasurable values are
+  reported as unavailable rather than as zero. Rendered statically from recorded
+  run data with no LLM involved.
 
 repository: https://github.com/meagerfindings/swamp-software-factory-flow-metrics
 

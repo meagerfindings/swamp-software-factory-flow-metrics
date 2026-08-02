@@ -1,6 +1,6 @@
 # @mgreten/software-factory-flow-metrics
 
-A deterministic **quality / reliability / flow** report for
+A deterministic **quality / reliability / flow / ceremony** report for
 [`@swamp/software-factory`](https://swamp-club.com) work items. It fires after
 the factory's `summary` method and reconstructs a run's flow metrics purely from
 the run data the factory already recorded — its state record, its journal, and
@@ -52,9 +52,16 @@ single-run report renders headline metrics plus a per-stage rollup:
 | Accepted first pass | yes | _source: journal journal-PROJ-123 v18_ |
 ```
 
+The additive `ceremony` block also reports raw and distinct human decisions,
+approval/rejection splits by gate, stage visits and cycles, review/patch
+frequency, explicit transition yield/park facts, cycle-limit overrides, and
+canonical work-class/risk/authority dimensions when present. Every ceremony
+value carries availability, provenance, and coverage where a denominator is
+involved. Missing durations are never treated as zero.
+
 When more than one run exists on the model instance, a cross-run aggregate is
-appended (accepted-first-pass rate, mean cycle time, cleanup-failure rate, and
-totals for dispatches / human touches / patch cycles).
+appended. Means use only available contributors and expose their actual
+coverage.
 
 ## Global Arguments
 
@@ -89,6 +96,15 @@ derives:
 - **terminal outcome class** (`done` | `cleanup-required` | `parked` |
   `aborted` | `active` | `unknown`);
 - **accepted-first-pass** — terminal `done`, zero rejections, exactly one era.
+
+Two requested duration metrics are intentionally unavailable with current
+canonical factory records:
+
+- **approval wait** requires a recorded request/pending timestamp as well as
+  `decidedAt`; stage entry is not used as a proxy;
+- **time to verified draft** requires an explicit verified-draft lifecycle
+  fact; arbitrary `evidence_recorded` and `findings_resolved` events do not
+  prove that endpoint.
 
 The report is deliberately zero-dependency and zod-free so it bundles cleanly as
 a report extension (report bundles are built without the extension import map).
