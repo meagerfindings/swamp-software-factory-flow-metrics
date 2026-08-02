@@ -1663,3 +1663,183 @@ Deno.test("loadMetricsData reads approval records addressed by gate ids in the j
   // The decision carries an approval-record source pointer.
   assert(c.humanTouches.sources.some((s) => s.kind === "approval"));
 });
+
+Deno.test("complete terminal run with no decisions reports trustworthy available zero", () => {
+  const workItem = "WI-ZERO";
+  const data = metricsData({
+    workItem,
+    slug: workItem,
+    status: "terminal",
+    stageId: "done",
+    journal: journal([
+      {
+        event: "started",
+        payload: { stage: "implementation" },
+        stageId: "implementation",
+        at: "2026-07-18T00:00:00.000Z",
+      },
+      {
+        event: "run_terminal",
+        payload: { transition: "finish", from: "implementation", to: "done" },
+        stageId: "done",
+        at: "2026-07-18T01:00:00.000Z",
+      },
+    ], workItem),
+  });
+  const c = buildFlowMetrics(data, workItem).ceremony;
+  for (
+    const value of [
+      c.humanTouches,
+      c.distinctDecisionCount,
+      c.approvals,
+      c.rejections,
+      c.cycleOverrideCount,
+    ]
+  ) {
+    assertEquals(value.value, 0);
+    assertEquals(value.availability, "available");
+  }
+});
+
+Deno.test("truncated journals expose surviving ceremony facts only as partial lower bounds", () => {
+  const workItem = "WI-TRUNCATED";
+  const surviving = metricsData({
+    workItem,
+    slug: workItem,
+    journalTruncated: true,
+    journal: journal([{
+      event: "started",
+      payload: { stage: "review" },
+      stageId: "review",
+      at: "2026-07-18T01:00:00.000Z",
+    }], workItem),
+  });
+  const observed = buildFlowMetrics(surviving, workItem).ceremony;
+  assertEquals(observed.stageVisitCount.value, 1);
+  assertEquals(observed.stageVisitCount.availability, "partial");
+  assertEquals(observed.uniqueStageCount.availability, "partial");
+  assertEquals(observed.reviewFrequency.availability, "partial");
+  assertStringIncludes(observed.stageVisitCount.reason ?? "", "lower bound");
+
+  const empty = metricsData({
+    workItem,
+    slug: workItem,
+    journalTruncated: true,
+    journal: [],
+  });
+  const missing = buildFlowMetrics(empty, workItem).ceremony;
+  assertEquals(missing.stageVisitCount.value, null);
+  assertEquals(missing.stageVisitCount.availability, "unavailable");
+  assertEquals(missing.reviewFrequency.value, null);
+  assertEquals(missing.humanTouches.value, null);
+});
+
+Deno.test("approval name enumeration discovers records absent from surviving journal events", async () => {
+  const slug = "WI-ENUM";
+  const state = {
+    workItem: slug,
+    stageId: "done",
+    cycles: {},
+    enteredAt: "2026-07-18T02:00:00.000Z",
+    status: "terminal",
+    definitionVersion: 1,
+    startedAt: "2026-07-18T00:00:00.000Z",
+  };
+  const approval = {
+    gateId: "hidden-gate",
+    workItem: slug,
+    decision: "approved",
+    actor: "human@example.com",
+    stageId: "review",
+    cycle: 2,
+    decidedAt: "2026-07-18T01:00:00.000Z",
+  };
+  const reader: RunDataReader = {
+    listNames: () =>
+      Promise.resolve([
+        `state-${slug}`,
+        `journal-${slug}`,
+        `approval-${slug}-hidden-gate`,
+      ]),
+    versionsOf: (name) =>
+      Promise.resolve(
+        name === `journal-${slug}` || name === `approval-${slug}-hidden-gate`
+          ? [1]
+          : [],
+      ),
+    read: (name) =>
+      Promise.resolve(
+        name === `state-${slug}` ? state : name === `journal-${slug}`
+          ? {
+            event: "started",
+            workItem: slug,
+            stageId: "implementation",
+            summary: "started",
+            payload: { stage: "implementation" },
+            at: "2026-07-18T00:00:00.000Z",
+          }
+          : name === `approval-${slug}-hidden-gate`
+          ? approval
+          : null,
+      ),
+  };
+  const data = await loadMetricsData(reader, slug);
+  assertEquals(data.approvalDiscoveryComplete, true);
+  assertEquals(data.approvalVersions.get("hidden-gate")?.size, 1);
+  assertEquals(buildFlowMetrics(data, slug).ceremony.approvals.value, 1);
+});
+
+Deno.test("ceremony JSON and Markdown retain canonical sources for derived rows", () => {
+  const workItem = "WI-SOURCES";
+  const data = metricsData({
+    workItem,
+    slug: workItem,
+    status: "terminal",
+    stageId: "done",
+    journal: journal([
+      {
+        event: "started",
+        payload: { stage: "implementation" },
+        stageId: "implementation",
+        at: "2026-07-18T00:00:00.000Z",
+      },
+      {
+        event: "approved",
+        payload: { gateId: "cycle-override:review", actor: "human" },
+        stageId: "implementation",
+        at: "2026-07-18T01:00:00.000Z",
+      },
+      {
+        event: "advanced",
+        payload: {
+          transition: "review",
+          from: "implementation",
+          to: "review",
+          cycle: 2,
+        },
+        stageId: "review",
+        at: "2026-07-18T01:30:00.000Z",
+      },
+    ], workItem),
+    approvals: [1, 2].map((version) => ({
+      gateId: "cycle-override:review",
+      version,
+      decision: "approved" as const,
+      stageId: "implementation",
+      cycle: 1,
+      decidedAt: "2026-07-18T01:00:00.000Z",
+    })),
+  });
+  const metrics = buildFlowMetrics(data, workItem);
+  const c = metrics.ceremony;
+  assert(c.duplicateDecisionSources.length > 0);
+  assert(c.approvalsByGateSources["cycle-override:review"].length > 0);
+  assert(c.stagesUnblockedSources.some((s) => s.kind === "journal"));
+  assert(c.boundedLoopExhaustionSources.some((s) => s.kind === "approval"));
+  const markdown = renderFlowMetricsMarkdown({ workItem, metrics });
+  assertStringIncludes(
+    markdown,
+    `approval approval-${workItem}-cycle-override:review`,
+  );
+  assertStringIncludes(markdown, `journal journal-${workItem} v3`);
+});

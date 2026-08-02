@@ -194,6 +194,8 @@ interface ApprovalRecord {
 
 /** Minimal read interface over a run's recorded data (state/journal/etc). */
 export interface RunDataReader {
+  /** All data instance names, when the backing repository can enumerate. */
+  listNames?(): Promise<string[]>;
   /** Every stored version of a data name, ascending. */
   versionsOf(name: string): Promise<number[]>;
   /** Parsed JSON content of one version (latest when omitted). */
@@ -216,6 +218,7 @@ interface ContentRepositoryLike {
     modelId: string,
     dataName: string,
   ): Promise<number[]>;
+  listNames?(type: unknown, modelId: string): Promise<string[]>;
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -251,6 +254,9 @@ function repositoryRunDataReader(opts: {
   modelId: string;
 }): RunDataReader {
   return {
+    listNames: opts.dataRepository.listNames === undefined
+      ? undefined
+      : () => opts.dataRepository.listNames!(opts.modelType, opts.modelId),
     versionsOf: (name) => {
       if (opts.dataRepository.listVersions === undefined) {
         return Promise.resolve([]);
@@ -410,6 +416,8 @@ export interface MetricsData {
    * lower bound rather than a complete history.
    */
   approvalsTruncated: boolean;
+  /** True when every approval instance for this run could be enumerated. */
+  approvalDiscoveryComplete?: boolean;
 }
 
 export async function loadMetricsData(
@@ -425,6 +433,7 @@ export async function loadMetricsData(
     evidenceVersions: new Map(),
     approvalVersions: new Map(),
     approvalsTruncated: false,
+    approvalDiscoveryComplete: false,
   };
 
   data.state = asRunState(await reader.read(stateInstance(slug)));
@@ -474,6 +483,23 @@ export async function loadMetricsData(
     }
   }
 
+  // Canonical approval records are independent data instances. Enumerate
+  // approval-<slug>-* when the repository supports it so a collected journal
+  // decision event cannot hide an otherwise surviving decision record.
+  if (reader.listNames !== undefined) {
+    try {
+      const prefix = `${APPROVAL_PREFIX}${slug}-`;
+      for (const name of await reader.listNames()) {
+        if (name.startsWith(prefix) && name.length > prefix.length) {
+          gateIds.add(name.slice(prefix.length));
+        }
+      }
+      data.approvalDiscoveryComplete = true;
+    } catch {
+      data.approvalDiscoveryComplete = false;
+    }
+  }
+
   for (const name of artifactNames) {
     const instance = artifactInstance(slug, name);
     const perVersion = new Map<number, ArtifactEnvelope>();
@@ -510,6 +536,13 @@ export async function loadMetricsData(
       perVersion.set(version, record);
     }
     data.approvalVersions.set(gateId, perVersion);
+  }
+
+  // Without name enumeration, a truncated journal may have lost gate ids and
+  // therefore approval instance addresses. Surviving records remain useful,
+  // but the discovered set is only a lower bound.
+  if (data.journalTruncated && !data.approvalDiscoveryComplete) {
+    data.approvalsTruncated = true;
   }
 
   return data;
@@ -728,6 +761,8 @@ export interface StageFlow {
   /** parkedAt / (advancedOut + parkedAt), or null when never resolved. */
   parkRate: number | null;
   sources: MetricSource[];
+  availability?: Availability;
+  reason?: string;
 }
 
 /**
@@ -780,12 +815,16 @@ export interface CeremonyMetrics {
   rawDecisionRecordCount: number;
   /** Every distinct decision, in first-decided order. */
   distinctDecisions: DistinctDecision[];
+  /** Approval sources for raw records collapsed by the distinct-decision key. */
+  duplicateDecisionSources: MetricSource[];
   /** Distinct approvals, total and per gate id. */
   approvals: TrustedValue<number>;
   approvalsByGate: Record<string, number>;
+  approvalsByGateSources: Record<string, MetricSource[]>;
   /** Distinct rejections, total and per gate id. */
   rejections: TrustedValue<number>;
   rejectionsByGate: Record<string, number>;
+  rejectionsByGateSources: Record<string, MetricSource[]>;
   /** Per-decision approval waits, including the unavailable ones. */
   approvalWaits: ApprovalWait[];
   /**
@@ -830,6 +869,8 @@ export interface CeremonyMetrics {
    * trace in recorded data at all.
    */
   boundedLoopExhaustions: CycleExhaustion[];
+  boundedLoopExhaustionsAvailability: Availability;
+  boundedLoopExhaustionsReason?: string;
   /** Human cycle-limit overrides granted, from exact override records. */
   cycleOverrideCount: TrustedValue<number>;
   /**
@@ -839,6 +880,10 @@ export interface CeremonyMetrics {
    * unblocking, because the records do not show it took effect.
    */
   stagesUnblocked: string[];
+  stagesUnblockedAvailability: Availability;
+  stagesUnblockedReason?: string;
+  stagesUnblockedSources: MetricSource[];
+  boundedLoopExhaustionSources: MetricSource[];
   /** Breakdown dimensions, verbatim or unknown. */
   dimensions: CeremonyDimensions;
   /** True when approval history may be incomplete (GC'd versions). */
@@ -1243,33 +1288,58 @@ function buildCeremonyMetrics(
 
   const approvalsByGate = countMap();
   const rejectionsByGate = countMap();
+  const approvalsByGateSources: Record<string, MetricSource[]> = {};
+  const rejectionsByGateSources: Record<string, MetricSource[]> = {};
   let approvals = 0;
   let rejections = 0;
-  for (const d of distinctDecisions) {
+  for (const entry of entriesSorted) {
+    const d = entry.decision;
     if (d.decision === "approved") {
       approvals += 1;
       approvalsByGate[d.gateId] = (approvalsByGate[d.gateId] ?? 0) + 1;
+      approvalsByGateSources[d.gateId] = [
+        ...(approvalsByGateSources[d.gateId] ?? []),
+        ...entry.sources,
+      ];
     } else {
       rejections += 1;
       rejectionsByGate[d.gateId] = (rejectionsByGate[d.gateId] ?? 0) + 1;
+      rejectionsByGateSources[d.gateId] = [
+        ...(rejectionsByGateSources[d.gateId] ?? []),
+        ...entry.sources,
+      ];
     }
   }
+  const duplicateDecisionSources = entriesSorted.flatMap((entry) =>
+    entry.sources.slice(1)
+  );
 
   // When no approval record survives, decision counts are unavailable rather
   // than 0 — "no records" and "no decisions" are different claims, and the
   // journal may still show decisions whose records were collected.
   const hasDecisionRecords = rawDecisionRecordCount > 0;
+  const trustworthyZero = !hasDecisionRecords && data.state !== null &&
+    !data.journalTruncated &&
+    !data.approvalsTruncated && data.approvalVersions.size === 0 &&
+    !data.journal.some(({ entry }) =>
+      entry.event === "approved" || entry.event === "rejected"
+    );
+  const decisionKnown = hasDecisionRecords || trustworthyZero;
   const decisionAvailability: Availability = hasDecisionRecords
     ? (data.approvalsTruncated ? "partial" : "available")
+    : trustworthyZero
+    ? "available"
     : "unavailable";
   const decisionReason = hasDecisionRecords
     ? (data.approvalsTruncated
       ? "some approval record versions were garbage-collected; counts are a lower bound"
       : undefined)
-    : "no approval records survive for this run; decision counts cannot be derived from exact human decision records";
+    : trustworthyZero
+    ? undefined
+    : "no approval records survive and the journal is missing, malformed, partial, or still references decisions; exact human decision counts cannot be derived";
 
   const trustedCount = (value: number): TrustedValue<number> => ({
-    value: hasDecisionRecords ? value : null,
+    value: decisionKnown ? value : null,
     availability: decisionAvailability,
     reason: decisionReason,
     sources: decisionSources,
@@ -1328,20 +1398,35 @@ function buildCeremonyMetrics(
 
   // --- Stage visits, unique stages, cycles ---------------------------------
   const journalHasStages = replay.totalVisits > 0;
-  const visitSources = journalHasStages ? [ctx.stateSource] : [];
+  const visitSources = replay.entries.map((entry) =>
+    ctx.journalSource(entry.version)
+  );
+  const journalLowerBound = data.journalTruncated && journalHasStages;
   const stageVisitCount: TrustedValue<number> = {
     value: journalHasStages ? replay.totalVisits : null,
-    availability: journalHasStages ? "available" : "unavailable",
+    availability: journalHasStages
+      ? (journalLowerBound ? "partial" : "available")
+      : "unavailable",
     reason: journalHasStages
-      ? undefined
+      ? (journalLowerBound
+        ? "journal history is truncated; surviving stage visits are a lower bound"
+        : undefined)
+      : data.journalTruncated
+      ? "journal history is truncated and no stage entry survives; zero cannot be established"
       : "no stage entry survives in the journal",
     sources: visitSources,
   };
   const uniqueStageCount: TrustedValue<number> = {
     value: journalHasStages ? replay.stageEntries.size : null,
-    availability: journalHasStages ? "available" : "unavailable",
+    availability: journalHasStages
+      ? (journalLowerBound ? "partial" : "available")
+      : "unavailable",
     reason: journalHasStages
-      ? undefined
+      ? (journalLowerBound
+        ? "journal history is truncated; surviving unique stages are a lower bound"
+        : undefined)
+      : data.journalTruncated
+      ? "journal history is truncated and no stage entry survives; zero cannot be established"
       : "no stage entry survives in the journal",
     sources: visitSources,
   };
@@ -1402,7 +1487,10 @@ function buildCeremonyMetrics(
     }
     return {
       value: matched / replay.totalVisits,
-      availability: "available",
+      availability: data.journalTruncated ? "partial" : "available",
+      reason: data.journalTruncated
+        ? `journal history is truncated; surviving ${label} frequency uses only the ${replay.totalVisits} observed visits`
+        : undefined,
       sources: visitSources,
       covered: matched,
       total: replay.totalVisits,
@@ -1433,6 +1521,10 @@ function buildCeremonyMetrics(
         yieldRate: denominator === 0 ? null : advancedOut / denominator,
         parkRate: denominator === 0 ? null : parkedAt / denominator,
         sources: [...outSources, ...parkSources],
+        availability: data.journalTruncated ? "partial" : "available",
+        reason: data.journalTruncated
+          ? "journal history is truncated; transition counts and rates are lower-bound observations"
+          : undefined,
       };
     });
 
@@ -1448,10 +1540,24 @@ function buildCeremonyMetrics(
   };
 
   // --- Overrides and the stages they actually unblocked --------------------
-  const overrideSources = decisionSources.length > 0 ? decisionSources : [];
+  const overrideEntries = entriesSorted.filter((entry) =>
+    entry.decision.isCycleOverride && entry.decision.decision === "approved"
+  );
+  const overrideSources = overrideEntries.flatMap((entry) => entry.sources);
+  const exhaustionCounts = new Map<string, number>();
+  for (const entry of overrideEntries) {
+    const target = entry.decision.gateId.slice(CYCLE_OVERRIDE_PREFIX.length);
+    if (target.length > 0) {
+      exhaustionCounts.set(target, (exhaustionCounts.get(target) ?? 0) + 1);
+    }
+  }
+  const boundedLoopExhaustions = [...exhaustionCounts]
+    .sort(([a], [b]) => a < b ? -1 : a > b ? 1 : 0)
+    .map(([stage, overrides]) => ({ stage, overrides }));
   const cycleOverrideCount: TrustedValue<number> = {
-    value: ctx.cycleOverrideGrants.length,
-    availability: "available",
+    value: decisionKnown ? overrideEntries.length : null,
+    availability: decisionAvailability,
+    reason: decisionReason,
     sources: overrideSources,
   };
   // An override counts as unblocking stage S only when the journal shows an
@@ -1472,6 +1578,12 @@ function buildCeremonyMetrics(
   const stagesUnblocked = [...unblocked].sort((a, b) =>
     a < b ? -1 : a > b ? 1 : 0
   );
+  const stagesUnblockedSources = [
+    ...overrideSources,
+    ...replay.entries.filter((entry) => unblocked.has(entry.stageId)).map(
+      (entry) => ctx.journalSource(entry.version),
+    ),
+  ];
 
   // --- Breakdown dimensions, verbatim or unknown ---------------------------
   const payload = ctx.workOrderPayload;
@@ -1497,10 +1609,13 @@ function buildCeremonyMetrics(
     distinctDecisionCount: trustedCount(distinctDecisions.length),
     rawDecisionRecordCount,
     distinctDecisions,
+    duplicateDecisionSources,
     approvals: trustedCount(approvals),
     approvalsByGate,
+    approvalsByGateSources,
     rejections: trustedCount(rejections),
     rejectionsByGate,
+    rejectionsByGateSources,
     approvalWaits,
     meanApprovalWaitMs,
     stageVisitCount,
@@ -1510,9 +1625,21 @@ function buildCeremonyMetrics(
     patchFrequency,
     stageFlow,
     timeToVerifiedDraftMs,
-    boundedLoopExhaustions: ctx.cycleExhaustions,
+    boundedLoopExhaustions,
+    boundedLoopExhaustionsAvailability: decisionAvailability,
+    boundedLoopExhaustionsReason: decisionReason,
     cycleOverrideCount,
     stagesUnblocked,
+    stagesUnblockedAvailability: data.journalTruncated
+      ? (stagesUnblocked.length > 0 ? "partial" : "unavailable")
+      : decisionAvailability,
+    stagesUnblockedReason: data.journalTruncated
+      ? (stagesUnblocked.length > 0
+        ? "journal history is truncated; listed stages are proven examples but may be incomplete"
+        : "journal history is truncated; absence of a surviving later stage entry cannot establish that no override unblocked a stage")
+      : decisionReason,
+    stagesUnblockedSources,
+    boundedLoopExhaustionSources: overrideSources,
     dimensions: {
       factory: ctx.factoryName,
       workClass,
@@ -2334,12 +2461,20 @@ function renderCeremony(c: CeremonyMetrics): string[] {
     String(
       c.rawDecisionRecordCount - (c.distinctDecisionCount.value ?? 0),
     ),
-    [],
+    c.duplicateDecisionSources,
   );
   trow("Approvals", c.approvals);
   trow("Rejections", c.rejections);
-  row("Approvals by gate", fmtCountMap(c.approvalsByGate), []);
-  row("Rejections by gate", fmtCountMap(c.rejectionsByGate), []);
+  row(
+    "Approvals by gate",
+    fmtCountMap(c.approvalsByGate),
+    Object.values(c.approvalsByGateSources).flat(),
+  );
+  row(
+    "Rejections by gate",
+    fmtCountMap(c.rejectionsByGate),
+    Object.values(c.rejectionsByGateSources).flat(),
+  );
   trow("Mean approval wait", c.meanApprovalWaitMs, fmtDuration);
   trow("Stage visits", c.stageVisitCount);
   trow("Unique stages", c.uniqueStageCount);
@@ -2350,15 +2485,37 @@ function renderCeremony(c: CeremonyMetrics): string[] {
   trow("Cycle overrides granted", c.cycleOverrideCount);
   row(
     "Stages unblocked by override",
-    c.stagesUnblocked.length === 0 ? "—" : c.stagesUnblocked.join(", "),
-    [],
+    fmtTrusted(
+      {
+        value: c.stagesUnblockedAvailability === "unavailable"
+          ? null
+          : c.stagesUnblocked.length,
+        availability: c.stagesUnblockedAvailability,
+        reason: c.stagesUnblockedReason,
+        sources: c.stagesUnblockedSources,
+      },
+      () => c.stagesUnblocked.length === 0 ? "—" : c.stagesUnblocked.join(", "),
+    ),
+    c.stagesUnblockedSources,
   );
   row(
     "Bounded-loop exhaustions",
-    c.boundedLoopExhaustions.length === 0 ? "—" : c.boundedLoopExhaustions
-      .map((e) => `${e.stage}: ${e.overrides}`)
-      .join(", "),
-    [],
+    fmtTrusted(
+      {
+        value: c.boundedLoopExhaustionsAvailability === "unavailable"
+          ? null
+          : c.boundedLoopExhaustions.length,
+        availability: c.boundedLoopExhaustionsAvailability,
+        reason: c.boundedLoopExhaustionsReason,
+        sources: c.boundedLoopExhaustionSources,
+      },
+      () =>
+        c.boundedLoopExhaustions.length === 0
+          ? "—"
+          : c.boundedLoopExhaustions.map((e) => `${e.stage}: ${e.overrides}`)
+            .join(", "),
+    ),
+    c.boundedLoopExhaustionSources,
   );
   row(
     "Dimensions (factory / work class / risk / authority)",
@@ -2405,8 +2562,8 @@ function renderCeremony(c: CeremonyMetrics): string[] {
   if (c.stageFlow.length > 0) {
     lines.push("#### Stage yield / park", "");
     lines.push(
-      "| Stage | Advanced out | Parked at | Yield rate | Park rate |",
-      "| --- | ---: | ---: | ---: | ---: |",
+      "| Stage | Advanced out | Parked at | Yield rate | Park rate | Availability | Traceability |",
+      "| --- | ---: | ---: | ---: | ---: | --- | --- |",
     );
     for (const s of c.stageFlow) {
       lines.push(
@@ -2417,6 +2574,12 @@ function renderCeremony(c: CeremonyMetrics): string[] {
             String(s.parkedAt),
             s.yieldRate === null ? "—" : fmtRate(s.yieldRate),
             s.parkRate === null ? "—" : fmtRate(s.parkRate),
+            escapeCell(
+              `${s.availability ?? "available"}${
+                s.reason !== undefined ? `: ${s.reason}` : ""
+              }`,
+            ),
+            `_${escapeCell(sourcePointer(s.sources))}_`,
           ].join(" | ") +
           " |",
       );
