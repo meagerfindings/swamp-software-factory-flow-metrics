@@ -194,6 +194,8 @@ interface ApprovalRecord {
 
 /** Minimal read interface over a run's recorded data (state/journal/etc). */
 export interface RunDataReader {
+  /** Canonical repository enumeration result for this model. */
+  findAllForModel?(): Promise<unknown[]>;
   /** All data instance names, when the backing repository can enumerate. */
   listNames?(): Promise<string[]>;
   /** Every stored version of a data name, ascending. */
@@ -218,6 +220,10 @@ interface ContentRepositoryLike {
     modelId: string,
     dataName: string,
   ): Promise<number[]>;
+  findAllForModel?(
+    type: unknown,
+    modelId: string,
+  ): Promise<unknown[]>;
   listNames?(type: unknown, modelId: string): Promise<string[]>;
 }
 
@@ -254,6 +260,10 @@ function repositoryRunDataReader(opts: {
   modelId: string;
 }): RunDataReader {
   return {
+    findAllForModel: opts.dataRepository.findAllForModel === undefined
+      ? undefined
+      : () =>
+        opts.dataRepository.findAllForModel!(opts.modelType, opts.modelId),
     listNames: opts.dataRepository.listNames === undefined
       ? undefined
       : () => opts.dataRepository.listNames!(opts.modelType, opts.modelId),
@@ -276,6 +286,48 @@ function repositoryRunDataReader(opts: {
         version,
       ),
   };
+}
+
+/** Normalize canonical Data entries (and tolerated adapter wrappers) to names. */
+function namesFromRepositoryEntries(entries: unknown[]): string[] {
+  const names: string[] = [];
+  for (const entry of entries) {
+    if (!isRecord(entry)) continue;
+    if (typeof entry.name === "string") {
+      names.push(entry.name);
+      continue;
+    }
+    // Some repository adapters wrap a canonical Data entry for global-style
+    // enumeration. Accept that shape without making it the primary contract.
+    if (isRecord(entry.data) && typeof entry.data.name === "string") {
+      names.push(entry.data.name);
+    }
+  }
+  return names;
+}
+
+/** Prefer swamp's canonical enumeration API; retain listNames compatibility. */
+async function enumerateReaderNames(
+  reader: RunDataReader,
+): Promise<{ names: string[]; complete: boolean }> {
+  if (reader.findAllForModel !== undefined) {
+    try {
+      return {
+        names: namesFromRepositoryEntries(await reader.findAllForModel()),
+        complete: true,
+      };
+    } catch {
+      // A supported secondary adapter may still be usable.
+    }
+  }
+  if (reader.listNames !== undefined) {
+    try {
+      return { names: await reader.listNames(), complete: true };
+    } catch {
+      // Journal-addressed names remain the final fallback.
+    }
+  }
+  return { names: [], complete: false };
 }
 
 // ---------------------------------------------------------------------------
@@ -486,18 +538,15 @@ export async function loadMetricsData(
   // Canonical approval records are independent data instances. Enumerate
   // approval-<slug>-* when the repository supports it so a collected journal
   // decision event cannot hide an otherwise surviving decision record.
-  if (reader.listNames !== undefined) {
-    try {
-      const prefix = `${APPROVAL_PREFIX}${slug}-`;
-      for (const name of await reader.listNames()) {
-        if (name.startsWith(prefix) && name.length > prefix.length) {
-          gateIds.add(name.slice(prefix.length));
-        }
+  const enumeration = await enumerateReaderNames(reader);
+  if (enumeration.complete) {
+    const prefix = `${APPROVAL_PREFIX}${slug}-`;
+    for (const name of enumeration.names) {
+      if (name.startsWith(prefix) && name.length > prefix.length) {
+        gateIds.add(name.slice(prefix.length));
       }
-      data.approvalDiscoveryComplete = true;
-    } catch {
-      data.approvalDiscoveryComplete = false;
     }
+    data.approvalDiscoveryComplete = true;
   }
 
   for (const name of artifactNames) {
@@ -630,8 +679,12 @@ export interface StageMetric {
   stageId: string;
   /** Number of distinct visits (entries) to this stage across all eras. */
   entries: number;
-  /** Total wall-clock ms spent in this stage (sum over visits). */
-  totalMs: number;
+  /** Total wall-clock ms over visits with valid endpoints, else null. */
+  totalMs: number | null;
+  /** Whether totalMs covers every visit, some visits, or none. */
+  durationAvailability: Availability;
+  /** Why duration is partial/unavailable. */
+  durationReason?: string;
   /**
    * Wall-clock ms from the run's start to this stage's FIRST entry — the
    * run's time-to-this-gate. Measured between two journal timestamps, so it
@@ -967,8 +1020,11 @@ export interface FlowMetrics {
    * silently backfilled.
    */
   deliveryMode: TracedValue<string | null>;
-  /** True when the run terminated at `done` with zero human rejections
-   * and exactly one implementation era (no reset) — accepted first pass. */
+  /**
+   * Proven-positive only: true when a complete, non-truncated journal proves
+   * terminal `done`, zero human rejections, and exactly one era. False also
+   * represents unknown/incomplete history; it is not a complete classifier.
+   */
   acceptedFirstPass: boolean;
   journalTruncated: boolean;
   /**
@@ -1121,7 +1177,7 @@ function msBetween(fromIso: string, toIso: string): number | undefined {
   const to = Date.parse(toIso);
   if (Number.isNaN(from) || Number.isNaN(to)) return undefined;
   const ms = to - from;
-  return ms < 0 ? 0 : ms;
+  return ms < 0 ? undefined : ms;
 }
 
 /** One reconstructed stage visit (a contiguous occupancy of a stage). */
@@ -1721,6 +1777,8 @@ export function buildFlowMetrics(
   // Per-stage rollup keyed by stageId.
   const stageEntries = new Map<string, number>();
   const stageMs = new Map<string, number>();
+  const stageValidDurationVisits = new Map<string, number>();
+  const stageInvalidDurationVisits = new Map<string, number>();
   const stageDispatches = new Map<string, number>();
   /** stageId → ISO timestamp of its first entry, for time-to-gate. */
   const stageFirstEnteredAt = new Map<string, string>();
@@ -1757,7 +1815,18 @@ export function buildFlowMetrics(
 
   const closeVisit = (visit: Visit, at: string) => {
     if (visit.leftAt === undefined) visit.leftAt = at;
-    const ms = msBetween(visit.enteredAt, at) ?? 0;
+    const ms = msBetween(visit.enteredAt, at);
+    if (ms === undefined) {
+      stageInvalidDurationVisits.set(
+        visit.stageId,
+        (stageInvalidDurationVisits.get(visit.stageId) ?? 0) + 1,
+      );
+      return;
+    }
+    stageValidDurationVisits.set(
+      visit.stageId,
+      (stageValidDurationVisits.get(visit.stageId) ?? 0) + 1,
+    );
     stageMs.set(visit.stageId, (stageMs.get(visit.stageId) ?? 0) + ms);
   };
 
@@ -1925,14 +1994,30 @@ export function buildFlowMetrics(
   };
   const stages: StageMetric[] = [...stageIds]
     .sort((a, b) => (a < b ? -1 : a > b ? 1 : 0))
-    .map((stageId) => ({
-      stageId,
-      entries: stageEntries.get(stageId) ?? 0,
-      totalMs: stageMs.get(stageId) ?? 0,
-      firstEnteredMs: firstEnteredMsFor(stageId),
-      dispatchAttempts: stageDispatches.get(stageId) ?? 0,
-      terminal: terminalStageId === stageId && runStatus === "terminal",
-    }));
+    .map((stageId) => {
+      const validVisits = stageValidDurationVisits.get(stageId) ?? 0;
+      const invalidVisits = stageInvalidDurationVisits.get(stageId) ?? 0;
+      const durationAvailability: Availability = invalidVisits === 0 &&
+          validVisits > 0
+        ? "available"
+        : validVisits > 0
+        ? "partial"
+        : "unavailable";
+      return {
+        stageId,
+        entries: stageEntries.get(stageId) ?? 0,
+        totalMs: validVisits > 0 ? stageMs.get(stageId) ?? 0 : null,
+        durationAvailability,
+        durationReason: durationAvailability === "available"
+          ? undefined
+          : validVisits > 0
+          ? `${invalidVisits} stage visit(s) had invalid duration endpoints; total covers ${validVisits} valid visit(s) only`
+          : "no stage visit had valid duration endpoints",
+        firstEnteredMs: firstEnteredMsFor(stageId),
+        dispatchAttempts: stageDispatches.get(stageId) ?? 0,
+        terminal: terminalStageId === stageId && runStatus === "terminal",
+      };
+    });
 
   // --- Time to terminal ----------------------------------------------------
   let timeToTerminal: number | null = null;
@@ -1981,11 +2066,12 @@ export function buildFlowMetrics(
   }
 
   // --- Accepted-first-pass -------------------------------------------------
-  // A run accepted on the first pass reached terminal `done` with no
-  // rejection and no reset (exactly one era).
+  // This public boolean is a proven-positive flag, not a complete
+  // classification. Unknown/incomplete history stays false.
   const acceptedFirstPass = runStatus === "terminal" &&
     terminalStageId === DONE_TERMINAL_STAGE &&
-    rejections === 0 && eras <= 1;
+    !data.journalTruncated &&
+    rejections === 0 && eras === 1;
 
   const humanTouches = approvals + rejections;
 
@@ -2319,7 +2405,7 @@ export function aggregateFlowMetrics(runs: FlowMetrics[]): FlowAggregate {
     abortedRuns,
     activeRuns,
     acceptedFirstPassRate: terminal.length > 0
-      ? doneRuns / terminal.length
+      ? terminal.filter((r) => r.acceptedFirstPass).length / terminal.length
       : null,
     meanTimeToTerminalMs,
     totalDispatchAttempts: runs.reduce(
@@ -2661,8 +2747,8 @@ function renderRunMetrics(m: FlowMetrics): string[] {
     lines.push("_No stage visits reconstructed._", "");
   } else {
     lines.push(
-      "| Stage | Entries | Total time | First entered | Dispatch attempts | Terminal |",
-      "| --- | ---: | ---: | ---: | ---: | --- |",
+      "| Stage | Entries | Total time | Duration trust | First entered | Dispatch attempts | Terminal |",
+      "| --- | ---: | ---: | --- | ---: | ---: | --- |",
     );
     for (const s of m.stages) {
       lines.push(
@@ -2670,7 +2756,12 @@ function renderRunMetrics(m: FlowMetrics): string[] {
           [
             `\`${escapeCell(s.stageId)}\``,
             String(s.entries),
-            fmtDuration(s.totalMs),
+            s.totalMs === null ? "unavailable" : fmtDuration(s.totalMs),
+            escapeCell(
+              `${s.durationAvailability}${
+                s.durationReason === undefined ? "" : `: ${s.durationReason}`
+              }`,
+            ),
             s.firstEnteredMs === null ? "—" : fmtDuration(s.firstEnteredMs),
             String(s.dispatchAttempts),
             s.terminal ? "yes" : "no",
@@ -2865,6 +2956,10 @@ interface ReportContext {
       modelId: string,
       dataName: string,
     ): Promise<number[]>;
+    findAllForModel?(
+      type: unknown,
+      modelId: string,
+    ): Promise<unknown[]>;
     listNames?(type: unknown, modelId: string): Promise<string[]>;
   };
 }
@@ -2909,19 +3004,12 @@ export const report = {
     const primarySlug = workItemSlug(workItem);
     const primaryData = await loadMetricsData(reader, primarySlug);
 
-    // Cross-run aggregate: enumerate every run state on the instance when the
-    // repository exposes name listing. Absent that, the report is single-run.
+    // Cross-run aggregate: prefer canonical model-data enumeration, with
+    // listNames retained as a compatible secondary route.
     const others: { workItem: string; data: MetricsData }[] = [];
-    if (context.dataRepository.listNames !== undefined) {
-      let names: string[] = [];
-      try {
-        names = await context.dataRepository.listNames(
-          context.modelType,
-          context.modelId,
-        );
-      } catch {
-        names = [];
-      }
+    const enumeration = await enumerateReaderNames(reader);
+    if (enumeration.complete) {
+      const names = enumeration.names;
       for (const slug of runSlugsFromNames(names)) {
         if (slug === primarySlug) continue;
         const data = await loadMetricsData(reader, slug);

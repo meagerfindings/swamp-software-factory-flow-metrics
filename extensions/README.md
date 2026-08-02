@@ -57,7 +57,9 @@ approval/rejection splits by gate, stage visits and cycles, review/patch
 frequency, explicit transition yield/park facts, cycle-limit overrides, and
 canonical work-class/risk/authority dimensions when present. Every ceremony
 value carries availability, provenance, and coverage where a denominator is
-involved. Missing durations are never treated as zero.
+involved. Stage durations likewise expose `available`, `partial`, or
+`unavailable` trust: malformed endpoints never become zero and only surviving
+valid visits contribute to totals and aggregate duration denominators.
 
 When more than one run exists on the model instance, a cross-run aggregate is
 appended. Means use only available contributors and expose their actual
@@ -77,7 +79,7 @@ Scope: `method` (activates on `@swamp/software-factory`'s `summary`).
 | Trigger | `modelType == @swamp/software-factory` and `methodName == summary` |
 | Primary input | `methodArgs.workItem` (the work item to report on) |
 | Failure path | Renders the failure reason instead of an empty placeholder |
-| Cross-run aggregate | Rendered when the data repository exposes `listNames` and >1 run exists |
+| Cross-run aggregate | Rendered when canonical `findAllForModel` (or compatible `listNames`) enumerates >1 run |
 
 ## How It Works
 
@@ -95,7 +97,10 @@ derives:
 - **patch cycles** (`findings_resolved` events + patch-stage re-entries);
 - **terminal outcome class** (`done` | `cleanup-required` | `parked` |
   `aborted` | `active` | `unknown`);
-- **accepted-first-pass** — terminal `done`, zero rejections, exactly one era.
+- **accepted-first-pass** — a proven-positive flag: `true` only when a complete,
+  non-truncated journal proves terminal `done`, zero rejections, and exactly one
+  era. `false` includes unknown/incomplete histories and is not a complete
+  classification.
 
 Two requested duration metrics are intentionally unavailable with current
 canonical factory records:

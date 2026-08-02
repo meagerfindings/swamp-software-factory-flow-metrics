@@ -1789,6 +1789,200 @@ Deno.test("approval name enumeration discovers records absent from surviving jou
   assertEquals(buildFlowMetrics(data, slug).ceremony.approvals.value, 1);
 });
 
+Deno.test("canonical findAllForModel discovers approval history without listNames or a journal decision", async () => {
+  const slug = "WI-CANONICAL-ENUM";
+  const approvalName = `approval-${slug}-surviving-gate`;
+  const reader: RunDataReader = {
+    findAllForModel: () =>
+      Promise.resolve([
+        { name: `state-${slug}`, version: 1 },
+        { name: `journal-${slug}`, version: 1 },
+        { name: approvalName, version: 2 },
+      ]),
+    versionsOf: (name) =>
+      Promise.resolve(
+        name === approvalName ? [1, 2] : name.startsWith("journal-") ? [1] : [],
+      ),
+    read: (name, version) => {
+      if (name === `state-${slug}`) {
+        return Promise.resolve({
+          workItem: slug,
+          stageId: "done",
+          cycles: {},
+          enteredAt: "2026-07-18T02:00:00.000Z",
+          status: "terminal",
+          definitionVersion: 1,
+          startedAt: "2026-07-18T00:00:00.000Z",
+        });
+      }
+      if (name === `journal-${slug}`) {
+        return Promise.resolve({
+          event: "started",
+          workItem: slug,
+          stageId: "implementation",
+          summary: "started",
+          payload: { stage: "implementation" },
+          at: "2026-07-18T00:00:00.000Z",
+        });
+      }
+      if (name === approvalName) {
+        return Promise.resolve({
+          gateId: "surviving-gate",
+          workItem: slug,
+          decision: version === 1 ? "rejected" : "approved",
+          actor: "human@example.com",
+          stageId: "review",
+          cycle: version,
+          decidedAt: `2026-07-18T0${version}:00:00.000Z`,
+        });
+      }
+      return Promise.resolve(null);
+    },
+  };
+
+  const data = await loadMetricsData(reader, slug);
+  assertEquals(data.approvalDiscoveryComplete, true);
+  assertEquals(data.approvalVersions.get("surviving-gate")?.size, 2);
+  assertEquals(buildFlowMetrics(data, slug).ceremony.rejections.value, 1);
+});
+
+Deno.test("acceptedFirstPass is true only with complete exactly-one-era proof", () => {
+  const terminalOnly = metricsData({
+    status: "terminal",
+    stageId: "done",
+    journal: journal([{
+      event: "run_terminal",
+      payload: { from: "implementation", to: "done", transition: "finish" },
+      at: "2026-07-18T01:00:00.000Z",
+    }], "WI-NO-ERA"),
+  });
+  assertEquals(buildFlowMetrics(terminalOnly, "WI-NO-ERA").eras.value, 0);
+  assertEquals(
+    buildFlowMetrics(terminalOnly, "WI-NO-ERA").acceptedFirstPass,
+    false,
+  );
+
+  const truncated = metricsData({
+    status: "terminal",
+    stageId: "done",
+    journalTruncated: true,
+    // This surviving suffix looks clean, but an earlier rejection may have
+    // been collected and therefore cannot be disproved.
+    journal: journal([
+      {
+        event: "started",
+        payload: { stage: "implementation" },
+        at: "2026-07-18T00:00:00.000Z",
+      },
+      {
+        event: "run_terminal",
+        payload: { from: "implementation", to: "done", transition: "finish" },
+        at: "2026-07-18T01:00:00.000Z",
+      },
+    ], "WI-TRUNCATED-PASS"),
+  });
+  assertEquals(
+    buildFlowMetrics(truncated, "WI-TRUNCATED-PASS").acceptedFirstPass,
+    false,
+  );
+
+  const valid = metricsData({
+    status: "terminal",
+    stageId: "done",
+    journal: journal([
+      {
+        event: "started",
+        payload: { stage: "implementation" },
+        at: "2026-07-18T00:00:00.000Z",
+      },
+      {
+        event: "run_terminal",
+        payload: { from: "implementation", to: "done", transition: "finish" },
+        at: "2026-07-18T01:00:00.000Z",
+      },
+    ], "WI-PROVEN-PASS"),
+  });
+  assertEquals(
+    buildFlowMetrics(valid, "WI-PROVEN-PASS").acceptedFirstPass,
+    true,
+  );
+});
+
+Deno.test("malformed stage duration endpoints are unavailable or partial, never zero", () => {
+  const workItem = "WI-DURATION-TRUST";
+  const partial = buildFlowMetrics(
+    metricsData({
+      workItem,
+      slug: workItem,
+      status: "terminal",
+      stageId: "done",
+      journal: journal([
+        {
+          event: "started",
+          payload: { stage: "implementation" },
+          at: "2026-07-18T00:00:00.000Z",
+        },
+        {
+          event: "reset",
+          stageId: "implementation",
+          at: "2026-07-18T00:10:00.000Z",
+        },
+        {
+          event: "run_terminal",
+          payload: { from: "implementation", to: "done", transition: "finish" },
+          // Earlier than the reset: this visit's endpoints are invalid.
+          at: "2026-07-18T00:05:00.000Z",
+        },
+      ], workItem),
+    }),
+    workItem,
+  );
+  const implementation = partial.stages.find((s) =>
+    s.stageId === "implementation"
+  );
+  assert(implementation !== undefined);
+  assertEquals(implementation.totalMs, 10 * 60 * 1000);
+  assertEquals(implementation.durationAvailability, "partial");
+
+  const unavailable = buildFlowMetrics(
+    metricsData({
+      workItem: "WI-BAD-DURATION",
+      slug: "WI-BAD-DURATION",
+      status: "terminal",
+      stageId: "done",
+      journal: journal([
+        {
+          event: "started",
+          payload: { stage: "implementation" },
+          at: "not-a-time",
+        },
+        {
+          event: "run_terminal",
+          payload: { from: "implementation", to: "done", transition: "finish" },
+          at: "2026-07-18T00:05:00.000Z",
+        },
+      ], "WI-BAD-DURATION"),
+    }),
+    "WI-BAD-DURATION",
+  );
+  const badStage = unavailable.stages.find((s) =>
+    s.stageId === "implementation"
+  );
+  assert(badStage !== undefined);
+  assertEquals(badStage.totalMs, null);
+  assertEquals(badStage.durationAvailability, "unavailable");
+  const markdown = renderFlowMetricsMarkdown({ workItem, metrics: partial });
+  assertStringIncludes(
+    markdown,
+    "partial: 1 stage visit(s) had invalid duration endpoints",
+  );
+  assertEquals(JSON.parse(JSON.stringify(unavailable)).stages[0].totalMs, null);
+
+  const aggregate = aggregateFlowMetrics([partial, unavailable]);
+  // The malformed run's terminal duration is excluded, not added as zero.
+  assertEquals(aggregate.meanTimeToTerminalMs, 5 * 60 * 1000);
+});
+
 Deno.test("ceremony JSON and Markdown retain canonical sources for derived rows", () => {
   const workItem = "WI-SOURCES";
   const data = metricsData({
