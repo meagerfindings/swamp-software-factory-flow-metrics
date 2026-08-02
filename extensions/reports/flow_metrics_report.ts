@@ -2970,7 +2970,7 @@ const FACTORY_TYPE = "@swamp/software-factory";
 export const report = {
   name: "@mgreten/software-factory-flow-metrics",
   description:
-    "Deterministic quality/reliability/flow/ceremony metrics for a factory work item — time-to-terminal, per-stage durations and entry counts, dispatch attempts, failed/parked stage, human touches, deduplicated decisions keyed by gate+stage+cycle+decision, per-gate approvals and rejections, approval wait durations, stage visits/cycles, review and patch frequency, stage yield and park rates, time to verified draft, bounded-loop exhaustion, cycle-limit overrides and the stages they unblocked, and terminal outcome — with a cross-run aggregate, every metric carrying a trust/availability label and a journal/approval/artifact source pointer so unmeasurable values read as unavailable rather than zero, rendered statically from recorded run data",
+    "Deterministic quality, reliability, flow, and ceremony metrics for a @swamp/software-factory work item, including terminal and stage timing, dispatches, human decisions, approval waits, review and patch frequency, yields, parks, bounded-loop exhaustion, overrides, and cross-run aggregates. Every value carries availability/trust and canonical source pointers; no LLM.",
   scope: "method",
   labels: ["software-factory"],
   execute: async (
