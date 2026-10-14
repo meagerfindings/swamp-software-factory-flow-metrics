@@ -1,6 +1,6 @@
 manifestVersion: 1
 name: "@mgreten/software-factory-flow-metrics"
-version: "2026.08.02.1"
+version: "2026.10.14.2"
 description: >
   Deterministic quality, reliability, flow, and ceremony metrics for a
   @swamp/software-factory work item — time-to-terminal, per-stage durations, entry
@@ -16,6 +16,7 @@ description: >
   run data with no LLM involved.
 
 repository: https://github.com/meagerfindings/swamp-software-factory-flow-metrics
+license: MIT
 
 models: []
 workflows: []
